@@ -132,6 +132,3 @@ Les performances dépendent de la qualité et de la représentativité des donn�
 
 Développé avec Python et Scikit-learn.
 
-## 📄 Licence
-
-Aucune licence spécifique n'est définie pour ce projet pour le moment.
