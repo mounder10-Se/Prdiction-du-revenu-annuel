@@ -1,211 +1,576 @@
 
-import pandas as pd
+# ============================================================
+# PROJET : PRÉDICTION DU REVENU ANNUEL
+# Objectif : prédire si le revenu est <=50K ou >50K
+# Fichier de données : adult.csv
+# ============================================================
+
+import os
+import warnings
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.impute import SimpleImputer, KNNImputer
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.naive_bayes import GaussianNB
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_curve, auc, classification_report
-import warnings
-warnings.filterwarnings('ignore')
 
-dataset = pd.read_csv("adult.csv")
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    classification_report,
+    confusion_matrix,
+    ConfusionMatrixDisplay,
+    RocCurveDisplay
+)
+from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
 
-df = dataset.copy()
+warnings.filterwarnings("ignore")
 
-df = df.replace(' ?', np.nan)
+# ------------------------------------------------------------
+# 1. CONFIGURATION
+# ------------------------------------------------------------
 
-df['income'] = df['income'].apply(lambda x: 0 if x.strip() == '<=50K' else 1)
+RANDOM_STATE = 42
+TEST_SIZE = 0.20
+DATA_FILE = "adult.csv"
 
-print("Distribution des classes:")
-print(df['income'].value_counts())
-print("\nNombre de valeurs manquantes par colonne:")
-print(df.isnull().sum())
+OUTPUT_DIR = "resultats"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns
-correlations = df[numeric_cols].corr()
+# ------------------------------------------------------------
+# 2. CHARGEMENT DES DONNÉES
+# ------------------------------------------------------------
 
-fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+print("=" * 65)
+print("PRÉDICTION DU REVENU ANNUEL")
+print("=" * 65)
 
-sns.heatmap(correlations, annot=True, cmap='coolwarm', fmt='.2f', ax=axes[0])
-axes[0].set_title('Heatmap des corrélations')
-df['income'].value_counts().plot(kind='bar', color=['skyblue', 'orange'], ax=axes[1])
-axes[1].set_title('Distribution des classes (income)')
-axes[1].set_ylabel('Nombre de personnes')
-plt.tight_layout()
-plt.savefig('eda_analysis.png')
-plt.close()
+if not os.path.exists(DATA_FILE):
+    raise FileNotFoundError(
+        f"Fichier '{DATA_FILE}' introuvable. "
+        "Place adult.csv dans le même dossier que index.py."
+    )
 
-categorical_cols = df.select_dtypes(include=['object']).columns.tolist()
-categorical_cols.remove('income') if 'income' in categorical_cols else None
+df = pd.read_csv(DATA_FILE, skipinitialspace=True)
 
-df_encoded = df.copy()
-label_encoders = {}
-for col in categorical_cols:
-    le = LabelEncoder()
-    df_encoded[col] = df_encoded[col].astype(str)
-    df_encoded[col] = le.fit_transform(df_encoded[col])
-    label_encoders[col] = le
+# Nettoyage des noms de colonnes
+df.columns = df.columns.str.strip()
 
-X = df_encoded.drop('income', axis=1)
-y = df_encoded['income']
+# Remplacer les valeurs manquantes courantes du dataset Adult
+df = df.replace(r"^\s*\?\s*$", np.nan, regex=True)
+df = df.replace(r"^\s*$", np.nan, regex=True)
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+print("\nDimensions du dataset :", df.shape)
+print("\nColonnes détectées :")
+print(df.columns.tolist())
 
-simple_imputer = SimpleImputer(strategy='most_frequent')
-X_train_simple = simple_imputer.fit_transform(X_train)
-X_test_simple = simple_imputer.transform(X_test)
+# ------------------------------------------------------------
+# 3. IDENTIFICATION DE LA COLONNE CIBLE
+# ------------------------------------------------------------
 
-knn_imputer = KNNImputer(n_neighbors=5)
-X_train_knn = knn_imputer.fit_transform(X_train)
-X_test_knn = knn_imputer.transform(X_test)
+# Le dataset Adult existe sous plusieurs variantes.
+# On accepte quelques noms fréquents pour la cible.
 
-scaler = StandardScaler()
-X_train_simple_scaled = scaler.fit_transform(X_train_simple)
-X_test_simple_scaled = scaler.transform(X_test_simple)
+target_candidates = [
+    "income",
+    "class",
+    "salary",
+    "revenu"
+]
 
-scaler_knn = StandardScaler()
-X_train_knn_scaled = scaler_knn.fit_transform(X_train_knn)
-X_test_knn_scaled = scaler_knn.transform(X_test_knn)
+target_col = next(
+    (col for col in target_candidates if col in df.columns.str.lower()),
+    None
+)
+
+if target_col is None:
+    raise ValueError(
+        "Impossible de trouver la colonne cible. "
+        "Vérifie si la colonne du revenu s'appelle 'income' ou 'class'. "
+        f"Colonnes présentes : {df.columns.tolist()}"
+    )
+
+# Conserver le nom réel de la colonne, même si sa casse diffère
+target_col = next(
+    col for col in df.columns
+    if col.lower() == target_col
+)
+
+print("\nColonne cible :", target_col)
+
+# Nettoyage des libellés de la cible
+df[target_col] = (
+    df[target_col]
+    .astype(str)
+    .str.strip()
+    .str.replace(".", "", regex=False)
+)
+
+# Conversion en classification binaire :
+# 0 = revenu <=50K
+# 1 = revenu >50K
+
+target_mapping = {
+    "<=50K": 0,
+    ">50K": 1,
+    "<=50K.": 0,
+    ">50K.": 1
+}
+
+df[target_col] = df[target_col].map(target_mapping)
+
+# Supprimer les lignes dont la cible est inconnue
+df = df.dropna(subset=[target_col])
+df[target_col] = df[target_col].astype(int)
+
+if df[target_col].nunique() != 2:
+    raise ValueError(
+        "La cible doit contenir exactement deux classes : "
+        "<=50K et >50K. Vérifie les valeurs de la colonne cible."
+    )
+
+print("\nRépartition des classes :")
+print(df[target_col].value_counts().rename(index={
+    0: "<=50K",
+    1: ">50K"
+}))
+
+# ------------------------------------------------------------
+# 4. PRÉPARATION DES VARIABLES
+# ------------------------------------------------------------
+
+X = df.drop(columns=[target_col])
+y = df[target_col]
+
+# Enlever les colonnes totalement vides
+empty_columns = X.columns[X.isna().all()].tolist()
+
+if empty_columns:
+    print("\nColonnes entièrement vides supprimées :", empty_columns)
+    X = X.drop(columns=empty_columns)
+
+# Détecter les colonnes numériques et catégorielles
+numeric_features = X.select_dtypes(
+    include=["number"]
+).columns.tolist()
+
+categorical_features = X.select_dtypes(
+    exclude=["number"]
+).columns.tolist()
+
+print("\nNombre de variables numériques :", len(numeric_features))
+print("Nombre de variables catégorielles :", len(categorical_features))
+
+# ------------------------------------------------------------
+# 5. SÉPARATION EN ENSEMBLES D'ENTRAÎNEMENT ET DE TEST
+# ------------------------------------------------------------
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    y,
+    test_size=TEST_SIZE,
+    random_state=RANDOM_STATE,
+    stratify=y
+)
+
+print("\nTaille de l'entraînement :", X_train.shape)
+print("Taille du test :", X_test.shape)
+
+# ------------------------------------------------------------
+# 6. PRÉTRAITEMENT DES DONNÉES
+# ------------------------------------------------------------
+
+# Pour les modèles compatibles avec une représentation sparse.
+numeric_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+categorical_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot", OneHotEncoder(handle_unknown="ignore"))
+])
+
+preprocessor_sparse = ColumnTransformer(
+    transformers=[
+        ("num", numeric_transformer, numeric_features),
+        ("cat", categorical_transformer, categorical_features)
+    ],
+    remainder="drop"
+)
+
+# HistGradientBoosting nécessite une matrice dense.
+# Ce préprocesseur lui est réservé pour éviter de convertir
+# inutilement les données de tous les autres modèles en dense.
+
+categorical_transformer_dense = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot", OneHotEncoder(
+        handle_unknown="ignore",
+        sparse_output=False
+    ))
+])
+
+preprocessor_dense = ColumnTransformer(
+    transformers=[
+        ("num", numeric_transformer, numeric_features),
+        ("cat", categorical_transformer_dense, categorical_features)
+    ],
+    remainder="drop"
+)
+
+# ------------------------------------------------------------
+# 7. DÉFINITION DES MODÈLES
+# ------------------------------------------------------------
 
 models = {
-    'KNN': KNeighborsClassifier(),
-    'NaiveBayes': GaussianNB(),
-    'DecisionTree': DecisionTreeClassifier(random_state=42),
-    'RandomForest': RandomForestClassifier(random_state=42)
+    "Extra Trees": Pipeline(steps=[
+        ("preprocessor", preprocessor_sparse),
+        ("classifier", ExtraTreesClassifier(
+            n_estimators=300,
+            random_state=RANDOM_STATE,
+            class_weight="balanced",
+            n_jobs=-1
+        ))
+    ]),
+
+    "Random Forest": Pipeline(steps=[
+        ("preprocessor", preprocessor_sparse),
+        ("classifier", RandomForestClassifier(
+            n_estimators=300,
+            random_state=RANDOM_STATE,
+            class_weight="balanced",
+            n_jobs=-1,
+            min_samples_leaf=2
+        ))
+    ]),
+
+    "Logistic Regression": Pipeline(steps=[
+        ("preprocessor", preprocessor_sparse),
+        ("classifier", LogisticRegression(
+            max_iter=2000,
+            class_weight="balanced",
+            random_state=RANDOM_STATE
+        ))
+    ]),
+
+    "Hist Gradient Boosting": Pipeline(steps=[
+        ("preprocessor", preprocessor_dense),
+        ("classifier", HistGradientBoostingClassifier(
+            max_iter=150,
+            learning_rate=0.1,
+            max_leaf_nodes=31,
+            random_state=RANDOM_STATE
+        ))
+    ])
 }
+
+# ------------------------------------------------------------
+# 8. ENTRAÎNEMENT ET ÉVALUATION
+# ------------------------------------------------------------
 
 results = []
+trained_models = {}
+predictions = {}
+probabilities = {}
 
-def evaluate_model(model, X_train, X_test, y_train, y_test, model_name, imputation_method):
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
-    y_pred_proba = model.predict_proba(X_test)[:, 1] if hasattr(model, 'predict_proba') else y_pred
-    
-    acc = accuracy_score(y_test, y_pred)
-    prec = precision_score(y_test, y_pred)
-    rec = recall_score(y_test, y_pred)
-    f1 = f1_score(y_test, y_pred)
-    
-    fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
-    roc_auc = auc(fpr, tpr)
-    
-    return {
-        'Model': model_name,
-        'Imputation': imputation_method,
-        'Accuracy': acc,
-        'Precision': prec,
-        'Recall': rec,
-        'F1-Score': f1,
-        'ROC-AUC': roc_auc
-    }
+print("\n" + "=" * 65)
+print("ENTRAÎNEMENT ET ÉVALUATION DES MODÈLES")
+print("=" * 65)
 
-print("\nÉvaluation des modèles avant optimisation:")
 for model_name, model in models.items():
-    print(f"\n{model_name}:")
-    
-    result_simple = evaluate_model(model, X_train_simple_scaled, X_test_simple_scaled, y_train, y_test, model_name, 'Simple')
-    results.append(result_simple)
-    print(f"  Simple Imputation - Accuracy: {result_simple['Accuracy']:.4f}, F1: {result_simple['F1-Score']:.4f}")
-    
-    result_knn = evaluate_model(model, X_train_knn_scaled, X_test_knn_scaled, y_train, y_test, model_name, 'KNN')
-    results.append(result_knn)
-    print(f"  KNN Imputation - Accuracy: {result_knn['Accuracy']:.4f}, F1: {result_knn['F1-Score']:.4f}")
+    print(f"\nEntraînement : {model_name}")
 
-param_grids = {
-    'KNN': {'n_neighbors': [3, 5, 7, 9], 'weights': ['uniform', 'distance']},
-    'NaiveBayes': {},
-    'DecisionTree': {'max_depth': [5, 10, 15, 20], 'min_samples_split': [2, 5, 10]},
-    'RandomForest': {'n_estimators': [50, 100, 200], 'max_depth': [10, 15, 20], 'min_samples_split': [2, 5]}
-}
+    try:
+        model.fit(X_train, y_train)
 
-results_optimized = []
+        y_pred = model.predict(X_test)
 
-print("\n\nOptimisation des hyperparamètres:")
-for model_name, model in models.items():
-    print(f"\n{model_name}:")
-    
-    if param_grids[model_name]:
-        grid_simple = GridSearchCV(model, param_grids[model_name], cv=5, scoring='f1', n_jobs=-1)
-        grid_simple.fit(X_train_simple_scaled, y_train)
-        best_model_simple = grid_simple.best_estimator_
-        print(f"  Meilleurs paramètres (Simple): {grid_simple.best_params_}")
-    else:
-        best_model_simple = model
-    
-    result_simple_opt = evaluate_model(best_model_simple, X_train_simple_scaled, X_test_simple_scaled, y_train, y_test, model_name, 'Simple_Optimized')
-    results_optimized.append(result_simple_opt)
-    print(f"  Simple Imputation Optimized - Accuracy: {result_simple_opt['Accuracy']:.4f}, F1: {result_simple_opt['F1-Score']:.4f}")
-    
-    if param_grids[model_name]:
-        grid_knn = GridSearchCV(model, param_grids[model_name], cv=5, scoring='f1', n_jobs=-1)
-        grid_knn.fit(X_train_knn_scaled, y_train)
-        best_model_knn = grid_knn.best_estimator_
-        print(f"  Meilleurs paramètres (KNN): {grid_knn.best_params_}")
-    else:
-        best_model_knn = model
-    
-    result_knn_opt = evaluate_model(best_model_knn, X_train_knn_scaled, X_test_knn_scaled, y_train, y_test, model_name, 'KNN_Optimized')
-    results_optimized.append(result_knn_opt)
-    print(f"  KNN Imputation Optimized - Accuracy: {result_knn_opt['Accuracy']:.4f}, F1: {result_knn_opt['F1-Score']:.4f}")
+        # Certaines versions de modèles peuvent ne pas proposer
+        # predict_proba ; dans ce cas, ROC-AUC reste indisponible.
+        y_proba = None
+        if hasattr(model, "predict_proba"):
+            y_proba = model.predict_proba(X_test)[:, 1]
 
-results_df = pd.DataFrame(results + results_optimized)
-results_df.to_csv('model_comparison_results.csv', index=False)
-print("\n\nRésultats sauvegardés dans 'model_comparison_results.csv'")
+        accuracy = accuracy_score(y_test, y_pred)
+        precision = precision_score(
+            y_test, y_pred, zero_division=0
+        )
+        recall = recall_score(
+            y_test, y_pred, zero_division=0
+        )
+        f1 = f1_score(
+            y_test, y_pred, zero_division=0
+        )
 
-fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        roc_auc = (
+            roc_auc_score(y_test, y_proba)
+            if y_proba is not None
+            else np.nan
+        )
 
-metrics = ['Accuracy', 'Precision', 'Recall', 'F1-Score']
-for idx, metric in enumerate(metrics):
-    ax = axes[idx // 2, idx % 2]
-    results_df_pivot = results_df.pivot(index='Model', columns='Imputation', values=metric)
-    results_df_pivot.plot(kind='bar', ax=ax)
-    ax.set_title(f'Comparaison - {metric}')
-    ax.set_ylabel(metric)
-    ax.set_xlabel('Model')
-    ax.legend(title='Imputation Method')
-    ax.grid(True, alpha=0.3)
+        results.append({
+            "Model": model_name,
+            "Accuracy": accuracy,
+            "Precision": precision,
+            "Recall": recall,
+            "F1-Score": f1,
+            "ROC-AUC": roc_auc
+        })
+
+        trained_models[model_name] = model
+        predictions[model_name] = y_pred
+
+        if y_proba is not None:
+            probabilities[model_name] = y_proba
+
+        print(f"Accuracy  : {accuracy:.4f}")
+        print(f"Precision : {precision:.4f}")
+        print(f"Recall    : {recall:.4f}")
+        print(f"F1-Score  : {f1:.4f}")
+        print(f"ROC-AUC   : {roc_auc:.4f}")
+
+    except Exception as error:
+        print(f"Erreur pour {model_name} : {error}")
+
+# ------------------------------------------------------------
+# 9. COMPARAISON DES RÉSULTATS
+# ------------------------------------------------------------
+
+if not results:
+    raise RuntimeError(
+        "Aucun modèle n'a pu être entraîné. "
+        "Vérifie le dataset et les erreurs affichées."
+    )
+
+results_df = pd.DataFrame(results)
+results_df = results_df.sort_values(
+    by="F1-Score",
+    ascending=False
+).reset_index(drop=True)
+
+results_path = os.path.join(
+    OUTPUT_DIR,
+    "model_comparison_results.csv"
+)
+
+results_df.to_csv(results_path, index=False)
+
+print("\n" + "=" * 65)
+print("COMPARAISON DES MODÈLES")
+print("=" * 65)
+print(results_df.to_string(index=False, float_format="%.4f"))
+
+# Choisir le meilleur modèle selon le F1-score
+best_model_name = results_df.iloc[0]["Model"]
+best_model = trained_models[best_model_name]
+best_predictions = predictions[best_model_name]
+
+print("\nMeilleur modèle selon le F1-score :", best_model_name)
+print(
+    "Accuracy du meilleur modèle : "
+    f"{accuracy_score(y_test, best_predictions):.4f}"
+)
+
+print("\nRapport de classification :")
+print(classification_report(
+    y_test,
+    best_predictions,
+    labels=[0, 1],
+    target_names=["<=50K", ">50K"],
+    zero_division=0
+))
+
+# ------------------------------------------------------------
+# 10. MATRICE DE CONFUSION DU MEILLEUR MODÈLE
+# ------------------------------------------------------------
+
+cm = confusion_matrix(
+    y_test,
+    best_predictions,
+    labels=[0, 1]
+)
+
+fig, ax = plt.subplots(figsize=(7, 5))
+
+ConfusionMatrixDisplay(
+    confusion_matrix=cm,
+    display_labels=["<=50K", ">50K"]
+).plot(
+    ax=ax,
+    cmap="Blues",
+    values_format="d",
+    colorbar=False
+)
+
+ax.set_title(f"Matrice de confusion - {best_model_name}")
+plt.tight_layout()
+
+plt.savefig(
+    os.path.join(OUTPUT_DIR, "confusion_matrix_best_model.png"),
+    dpi=300,
+    bbox_inches="tight"
+)
+plt.close()
+
+# ------------------------------------------------------------
+# 11. COURBE ROC DU MEILLEUR MODÈLE
+# ------------------------------------------------------------
+
+if best_model_name in probabilities:
+    fig, ax = plt.subplots(figsize=(7, 5))
+
+    RocCurveDisplay.from_predictions(
+        y_test,
+        probabilities[best_model_name],
+        ax=ax,
+        name=best_model_name
+    )
+
+    ax.plot(
+        [0, 1],
+        [0, 1],
+        linestyle="--",
+        label="Classification aléatoire"
+    )
+
+    ax.set_title(f"Courbe ROC - {best_model_name}")
+    ax.legend()
+    plt.tight_layout()
+
+    plt.savefig(
+        os.path.join(OUTPUT_DIR, "roc_curve_best_model.png"),
+        dpi=300,
+        bbox_inches="tight"
+    )
+    plt.close()
+
+# ------------------------------------------------------------
+# 12. VISUALISATION DE COMPARAISON DES MODÈLES
+# ------------------------------------------------------------
+
+metrics_to_plot = [
+    "Accuracy",
+    "Precision",
+    "Recall",
+    "F1-Score",
+    "ROC-AUC"
+]
+
+plot_df = results_df.melt(
+    id_vars="Model",
+    value_vars=metrics_to_plot,
+    var_name="Metric",
+    value_name="Score"
+)
+
+fig, ax = plt.subplots(figsize=(12, 6))
+
+sns.barplot(
+    data=plot_df,
+    x="Model",
+    y="Score",
+    hue="Metric",
+    ax=ax
+)
+
+ax.set_title("Comparaison des performances des modèles")
+ax.set_ylim(0, 1)
+ax.set_ylabel("Score")
+ax.set_xlabel("Modèle")
+ax.tick_params(axis="x", rotation=20)
+ax.legend(title="Métrique")
+plt.tight_layout()
+
+plt.savefig(
+    os.path.join(OUTPUT_DIR, "model_comparison_visualization.png"),
+    dpi=300,
+    bbox_inches="tight"
+)
+plt.close()
+
+# ------------------------------------------------------------
+# 13. ANALYSE EXPLORATOIRE SIMPLE
+# ------------------------------------------------------------
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+# Distribution des classes
+class_counts = y.value_counts().sort_index()
+
+axes[0].bar(
+    ["<=50K", ">50K"],
+    [
+        class_counts.get(0, 0),
+        class_counts.get(1, 0)
+    ]
+)
+axes[0].set_title("Répartition des revenus")
+axes[0].set_ylabel("Nombre d'individus")
+
+# Valeurs manquantes par colonne
+missing_percent = (
+    df.isna().mean() * 100
+).sort_values(ascending=False)
+
+missing_percent = missing_percent[missing_percent > 0].head(15)
+
+if not missing_percent.empty:
+    axes[1].barh(
+        missing_percent.index.astype(str),
+        missing_percent.values
+    )
+    axes[1].set_title("Pourcentage de valeurs manquantes")
+    axes[1].set_xlabel("Pourcentage (%)")
+    axes[1].invert_yaxis()
+else:
+    axes[1].text(
+        0.5, 0.5,
+        "Aucune valeur manquante détectée",
+        ha="center",
+        va="center"
+    )
+    axes[1].set_axis_off()
 
 plt.tight_layout()
-plt.savefig('model_comparison_visualization.png')
+
+plt.savefig(
+    os.path.join(OUTPUT_DIR, "eda_analysis.png"),
+    dpi=300,
+    bbox_inches="tight"
+)
 plt.close()
 
-print("\nGraphiques sauvegardés dans 'model_comparison_visualization.png'")
+# ------------------------------------------------------------
+# 14. RÉSUMÉ FINAL
+# ------------------------------------------------------------
 
-best_model = RandomForestClassifier(n_estimators=200, max_depth=20, min_samples_split=2, random_state=42)
-best_model.fit(X_train_knn_scaled, y_train)
-y_pred_best = best_model.predict(X_test_knn_scaled)
+print("\n" + "=" * 65)
+print("EXÉCUTION TERMINÉE")
+print("=" * 65)
 
-cm = confusion_matrix(y_test, y_pred_best)
-plt.figure(figsize=(8, 6))
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-plt.title('Matrice de confusion - Meilleur modèle')
-plt.ylabel('Vrai')
-plt.xlabel('Prédit')
-plt.savefig('confusion_matrix_best_model.png')
-plt.close()
+print("Meilleur modèle :", best_model_name)
+print(
+    "Accuracy : "
+    f"{accuracy_score(y_test, best_predictions):.4f}"
+)
+print(
+    "F1-score : "
+    f"{f1_score(y_test, best_predictions, zero_division=0):.4f}"
+)
 
-y_pred_proba_best = best_model.predict_proba(X_test_knn_scaled)[:, 1]
-fpr, tpr, _ = roc_curve(y_test, y_pred_proba_best)
-roc_auc = auc(fpr, tpr)
-
-plt.figure(figsize=(8, 6))
-plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')
-plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-plt.xlim([0.0, 1.0])
-plt.ylim([0.0, 1.05])
-plt.xlabel('Taux de faux positifs')
-plt.ylabel('Taux de vrais positifs')
-plt.title('Courbe ROC - Meilleur modèle')
-plt.legend(loc="lower right")
-plt.grid(True, alpha=0.3)
-plt.savefig('roc_curve_best_model.png')
-plt.close()
-
-print("\n\nAnalyse terminée avec succès!")
-print(f"Meilleure performance: {results_df.loc[results_df['F1-Score'].idxmax()]}")
+print(f"\nLes résultats sont enregistrés dans : {OUTPUT_DIR}")
+print("Fichiers générés :")
+print("- model_comparison_results.csv")
+print("- confusion_matrix_best_model.png")
+print("- roc_curve_best_model.png (si disponible)")
+print("- model_comparison_visualization.png")
+print("- eda_analysis.png")
